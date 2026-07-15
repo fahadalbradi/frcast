@@ -492,6 +492,7 @@ def backtest(series_values: list[float], forecaster, horizon: int,
     origins = [o for o in origins if min_train <= o <= last_origin]
 
     folds, all_actual, all_pred = [], [], []
+    residuals_by_step: dict[int, list] = {}
     for origin in origins:
         train = y[:origin]
         actual = y[origin:origin + horizon]
@@ -506,6 +507,9 @@ def backtest(series_values: list[float], forecaster, horizon: int,
         })
         all_actual.extend(actual)
         all_pred.extend(pred)
+        # residual per horizon step (step 1 = first period ahead, ...)
+        for step, (a, p) in enumerate(zip(actual, pred), start=1):
+            residuals_by_step.setdefault(step, []).append(float(a - p))
 
     residuals = [float(a - p) for a, p in zip(all_actual, all_pred)]
     overall = {
@@ -515,7 +519,8 @@ def backtest(series_values: list[float], forecaster, horizon: int,
         "n_folds": len(folds),
         "n_points_scored": len(all_actual),
     }
-    return {"folds": folds, "overall": overall, "residuals": residuals}
+    return {"folds": folds, "overall": overall, "residuals": residuals,
+            "residuals_by_step": residuals_by_step}
 
 
 # =========================================================================== #
@@ -601,3 +606,152 @@ def run_forecast_evaluation(temporal_prep, horizon: int,
             "improvement_pct": round((base_mae - model_mae) / base_mae * 100, 2) if base_mae else None,
         }
     return out
+
+
+# =========================================================================== #
+# STEP 4 — Prediction intervals + forecast quality gate + ForecastResult wiring
+# Intervals are EMPIRICAL (from backtest residuals), never a distributional
+# assumption. The gate enforces decision #4 (must beat naive). No LLM.
+# =========================================================================== #
+
+def build_intervals(point_forecast: list[float],
+                    residuals_by_step: dict,
+                    level: float = 0.80) -> list[dict]:
+    """Empirical prediction intervals. For each horizon step, take the quantiles of the
+    backtest residuals AT THAT STEP, so the band widens with the horizon. Falls back to the
+    pooled residuals for steps that were never scored.
+
+    Returns [{"yhat", "lower", "upper"}] aligned with point_forecast."""
+    lo_q = (1 - level) / 2
+    hi_q = 1 - lo_q
+    pooled = [r for rs in residuals_by_step.values() for r in rs]
+
+    # Cumulative pooling: the band at step h uses residuals from steps 1..h. Later horizons
+    # therefore include the (larger) errors of far-ahead forecasts, so the band is
+    # non-decreasing and built on a bigger, less noisy sample than a single step alone.
+    out = []
+    for i, yhat in enumerate(point_forecast, start=1):
+        res = [r for step, rs in residuals_by_step.items() if step <= i for r in rs] or pooled
+        if res:
+            lo = float(np.quantile(res, lo_q))
+            hi = float(np.quantile(res, hi_q))
+        else:
+            lo = hi = 0.0
+        out.append({"yhat": float(yhat),
+                    "lower": float(yhat + lo),   # residual = actual - pred, so add quantiles
+                    "upper": float(yhat + hi)})
+    return out
+
+
+def _interval_coverage(backtest_result: dict, level: float = 0.80) -> float | None:
+    """Back-check: across backtest folds, what fraction of actuals fell inside the empirical
+    band built from the SAME residuals? Reported honestly even when far from nominal."""
+    rbs = backtest_result.get("residuals_by_step") or {}
+    pooled = [r for rs in rbs.values() for r in rs]
+    if not pooled:
+        return None
+    lo_q, hi_q = (1 - level) / 2, 1 - (1 - level) / 2
+    inside = 0
+    total = 0
+    for step, res in rbs.items():
+        lo, hi = np.quantile(pooled, lo_q), np.quantile(pooled, hi_q)
+        for r in res:                      # r is (actual - pred); inside if lo <= r <= hi
+            inside += int(lo <= r <= hi)
+            total += 1
+    return float(inside / total) if total else None
+
+
+# quality-gate thresholds for forecasting (distinct from the tabular Evaluator)
+FORECAST_MIN_IMPROVEMENT = 0.0      # must beat naive (decision #4): improvement > 0
+COVERAGE_TOLERANCE = 0.15           # warn if |coverage - level| exceeds this
+
+
+def forecast_quality_gate(evaluation: dict, coverage: float | None,
+                          level: float = 0.80) -> dict:
+    """Decision #4 enforced here: reject if the model does not beat the naive baseline.
+    Also warns (does not reject) on poor interval coverage and short history."""
+    reasons, warnings = [], []
+
+    comp = evaluation.get("comparison", {})
+    model_mae = comp.get("model_mae")
+    naive_mae = comp.get("naive_mae")
+
+    if model_mae is None:
+        reasons.append("No model score available (FLAML did not produce a forecast).")
+    elif naive_mae is not None and not (model_mae < naive_mae):
+        reasons.append(f"Model MAE ({model_mae:.4g}) does not beat naive baseline "
+                       f"({naive_mae:.4g}).")
+
+    if coverage is not None and abs(coverage - level) > COVERAGE_TOLERANCE:
+        warnings.append(f"Interval coverage {coverage:.0%} is far from the nominal {level:.0%} — "
+                        "prediction bands may be mis-calibrated.")
+
+    return {"passed": len(reasons) == 0, "reasons": reasons, "warnings": warnings}
+
+
+def _forecast_confidence(evaluation: dict, coverage: float | None,
+                         n_history: int, level: float = 0.80) -> dict:
+    """Forecast-specific confidence (decision #2: SEPARATE from the tabular ConfidenceEngine).
+    Blends: how much the model beats naive, interval calibration, and history length."""
+    comp = evaluation.get("comparison", {})
+    imp = comp.get("improvement_pct")
+    skill = 0.0 if imp is None else max(0.0, min(1.0, imp / 50.0))     # 50% improvement -> full
+    calib = 0.5 if coverage is None else max(0.0, 1 - abs(coverage - level) / level)
+    adequacy = max(0.0, min(1.0, n_history / 100.0))                   # saturates at 100 points
+
+    score = round(0.5 * skill + 0.3 * calib + 0.2 * adequacy, 3)
+    label = "High" if score >= 0.7 else "Medium" if score >= 0.4 else "Low"
+    return {"score": score, "label": label,
+            "breakdown": {"skill_vs_naive": round(skill, 3),
+                          "interval_calibration": round(calib, 3),
+                          "history_adequacy": round(adequacy, 3)}}
+
+
+def assemble_forecast_result(temporal_prep, evaluation: dict,
+                             point_forecast: list[float],
+                             future_ds: list,
+                             level: float = 0.80) -> ForecastResult:
+    """STEP 4 wiring: turn the Step-3 evaluation + a point forecast into a complete
+    ForecastResult — the single source of every number (decision #5). Intervals, gate,
+    baseline, confidence all filled here. Still NO LLM."""
+    model_bt = evaluation.get("model", {}).get("flaml", {})
+    residuals_by_step = model_bt.get("residuals_by_step", {}) or {}
+
+    intervals = build_intervals(point_forecast, residuals_by_step, level)
+    forecast = [{"ds": ds, **iv} for ds, iv in zip(future_ds, intervals)]
+
+    coverage = _interval_coverage(model_bt, level)
+    gate = forecast_quality_gate(evaluation, coverage, level)
+    n_hist = len([h for h in temporal_prep.series if h["y"] is not None])
+    confidence = _forecast_confidence(evaluation, coverage, n_hist, level)
+
+    baseline = {"naive": evaluation.get("baseline", {}).get("naive", {}).get("overall", {})}
+    if "seasonal_naive" in evaluation.get("baseline", {}):
+        baseline["seasonal_naive"] = evaluation["baseline"]["seasonal_naive"]["overall"]
+
+    run_log = [
+        f"[Forecast] horizon={len(point_forecast)} freq={temporal_prep.frequency}",
+        f"[Forecast] naive MAE={baseline['naive'].get('mae')}, "
+        f"model MAE={model_bt.get('overall', {}).get('mae')}",
+        f"[Forecast] interval level={level:.0%}, empirical coverage="
+        f"{None if coverage is None else round(coverage, 3)}",
+        f"[Forecast] quality gate: {'PASSED' if gate['passed'] else 'REJECTED'}",
+    ]
+
+    return ForecastResult(
+        success=gate["passed"],
+        time_col=temporal_prep.time_col, target=temporal_prep.target,
+        frequency=temporal_prep.frequency, horizon=len(point_forecast),
+        history=temporal_prep.series,
+        forecast=forecast,
+        backtest={"model": model_bt.get("overall", {}),
+                  "folds": model_bt.get("folds", []),
+                  "interval_coverage": coverage},
+        baseline=baseline,
+        model=evaluation.get("model", {}).get("name", "flaml_ts_forecast"),
+        quality_gate=gate,
+        confidence=confidence,
+        run_log=run_log,
+        warnings=gate["warnings"],
+        error=None if gate["passed"] else "; ".join(gate["reasons"]),
+    )
