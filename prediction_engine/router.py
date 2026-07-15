@@ -193,7 +193,11 @@ class PredictionTool:
         if not result.success:
             log.add("tool_execution", "prediction_pipeline_failed", result.error or "",
                     {"engine_run_log": result.run_log}, status="error")
-            return ToolResult(self.name, "error", result, result.error or "pipeline failed")
+            # Same output shape as the success path, so callers can always read
+            # output["engine_result"] regardless of status (contract: output is a dict).
+            return ToolResult(self.name, "error",
+                              {"engine_result": result, "predictions": None},
+                              result.error or "pipeline failed")
 
         log.add("tool_execution", "prediction_pipeline_completed",
                 f"best estimator: {result.training.best_estimator}",

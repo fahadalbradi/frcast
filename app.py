@@ -82,7 +82,10 @@ if df is not None and run_clicked:
             explicit_intent=Intent.PREDICTION,      # the button IS the intent
         )
         st.session_state.events = tool_result.events
-        result = tool_result.output["engine_result"] if tool_result.output else None
+        # output is a dict on both success and error paths; guard anyway in case a future
+        # tool returns a different shape, so the app never crashes on a failed run.
+        out = tool_result.output
+        result = out.get("engine_result") if isinstance(out, dict) else None
         st.session_state.engine_result = result
         st.session_state.engine = engine
         st.session_state.router = router
@@ -291,10 +294,11 @@ if result is not None:
                     engine_result=result,           # reuse the trained model, do not retrain
                 )
                 st.session_state.events = tr.events
-                if tr.status != "ok" or not tr.output["predictions"]:
+                preds = tr.output.get("predictions") if isinstance(tr.output, dict) else None
+                if tr.status != "ok" or not preds:
                     st.error(f"Could not calculate prediction: {tr.message}")
                 else:
-                    pred_value = tr.output["predictions"][0]
+                    pred_value = preds[0]
                     if fp.task_type == "classification":
                         if "__target__" in result.preprocessing.encoders:
                             le = result.preprocessing.encoders["__target__"]

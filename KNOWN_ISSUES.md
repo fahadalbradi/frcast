@@ -803,3 +803,31 @@ gap-handling logic is defined in a later stage.
 - unknown strategy still rejected.
 
 No default fill is applied anywhere. The decision stays with the caller.
+
+---
+
+# FIX LOG — 'EngineResult' object is not subscriptable (app.py:85)
+
+**Diagnosis (answering the three questions): none of the three.** The contract MATCHED on the
+success path — PredictionTool returns `output = {"engine_result":..., "predictions":...}`, which
+is what app.py reads. The mismatch was on the ERROR path only:
+
+```python
+# router.py, failure branch — BEFORE
+return ToolResult(self.name, "error", result, ...)   # result is a raw EngineResult, not a dict
+```
+
+`app.py:85` read `tool_result.output["engine_result"]` WITHOUT checking status, so a failed
+pipeline (e.g. quality-gate rejection on weak data) made output a raw EngineResult and the
+subscription blew up. It was a latent bug that only surfaced the first time a run failed —
+app.py had always assumed success.
+
+**Fix — unify the contract (option B): `output` is ALWAYS a dict.**
+- `router.py`: the failure branch now returns `{"engine_result": result, "predictions": None}`,
+  same shape as success.
+- `app.py`: reads defensively via `out.get("engine_result") if isinstance(out, dict) else None`
+  (line 85) and the same guard for `predictions` in the Predict tab (was also unguarded).
+
+Verified: failing pipeline -> no crash, result still extracted; success unchanged (R2 0.9852);
+predict on a failed model -> clean error, no crash; forecast placeholder (output=None) and
+explanation both fine. Frozen ML core byte-identical.
