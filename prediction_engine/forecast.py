@@ -421,3 +421,183 @@ def prepare_temporal(forecast_result: ForecastResult,
         n_filled=n_filled, gap_index=gap_index, gap_runs=gap_runs,
         leading_trailing_trimmed=trimmed, run_log=run_log, warnings=warnings,
     )
+
+
+# =========================================================================== #
+# STEP 3a — Backtest harness + naive baseline (NO ML, fully testable)
+# Rolling-origin backtest. A "forecaster" is any callable:
+#     fn(history_values: list[float], horizon: int) -> list[float]
+# The harness knows nothing about FLAML; the baseline and (later) the FLAML model
+# both plug into it through this signature.
+# =========================================================================== #
+
+def _mae(actual, pred):
+    a = np.asarray(actual, float); p = np.asarray(pred, float)
+    return float(np.mean(np.abs(a - p)))
+
+
+def _rmse(actual, pred):
+    a = np.asarray(actual, float); p = np.asarray(pred, float)
+    return float(np.sqrt(np.mean((a - p) ** 2)))
+
+
+def _mape(actual, pred):
+    a = np.asarray(actual, float); p = np.asarray(pred, float)
+    mask = a != 0
+    if not mask.any():
+        return None
+    return float(np.mean(np.abs((a[mask] - p[mask]) / a[mask])) * 100)
+
+
+# ---- baseline forecasters (the mandatory naive, decision #4) ----
+
+def naive_forecaster(history: list[float], horizon: int) -> list[float]:
+    """Repeat the last observed value h times. The floor every model must beat."""
+    return [float(history[-1])] * horizon
+
+
+def seasonal_naive_forecaster(period: int):
+    """Repeat the value from `period` steps ago. Returned as a closure so the harness
+    can call it with the same (history, horizon) signature."""
+    def _fn(history: list[float], horizon: int) -> list[float]:
+        if len(history) < period:
+            return naive_forecaster(history, horizon)
+        # take the last full season, then repeat it forward
+        last_season = history[-period:]
+        return [float(last_season[i % period]) for i in range(horizon)]
+    return _fn
+
+
+def backtest(series_values: list[float], forecaster, horizon: int,
+             n_folds: int = 5, min_train: int | None = None) -> dict:
+    """Rolling-origin backtest. Trains on a growing prefix, forecasts `horizon` ahead,
+    scores against the held-out actuals. TIME-ORDERED — never shuffles (decision: temporal
+    leakage). Returns per-fold and overall MAE/RMSE/MAPE plus the residuals (for later
+    interval construction)."""
+    y = [float(v) for v in series_values]
+    n = len(y)
+    if min_train is None:
+        min_train = max(horizon, n // 2)
+
+    # fold origins: last training index for each fold, spaced across the tail
+    last_origin = n - horizon
+    if last_origin <= min_train:
+        return {"error": f"series too short for backtest: need > {min_train + horizon} points, "
+                         f"have {n}.", "folds": [], "overall": {}}
+
+    origins = sorted(set(
+        int(round(min_train + i * (last_origin - min_train) / max(1, n_folds - 1)))
+        for i in range(n_folds)
+    ))
+    origins = [o for o in origins if min_train <= o <= last_origin]
+
+    folds, all_actual, all_pred = [], [], []
+    for origin in origins:
+        train = y[:origin]
+        actual = y[origin:origin + horizon]
+        pred = forecaster(train, horizon)[:horizon]
+        if len(pred) < len(actual):                       # forecaster returned short
+            pred = list(pred) + [pred[-1]] * (len(actual) - len(pred))
+        folds.append({
+            "train_end": origin,
+            "mae": _mae(actual, pred),
+            "rmse": _rmse(actual, pred),
+            "mape": _mape(actual, pred),
+        })
+        all_actual.extend(actual)
+        all_pred.extend(pred)
+
+    residuals = [float(a - p) for a, p in zip(all_actual, all_pred)]
+    overall = {
+        "mae": _mae(all_actual, all_pred),
+        "rmse": _rmse(all_actual, all_pred),
+        "mape": _mape(all_actual, all_pred),
+        "n_folds": len(folds),
+        "n_points_scored": len(all_actual),
+    }
+    return {"folds": folds, "overall": overall, "residuals": residuals}
+
+
+# =========================================================================== #
+# STEP 3b — FLAML ts_forecast wrapper
+# ---------------------------------------------------------------------------
+# !!! NOT EXECUTED in the build environment: flaml[ts_forecast] is not installed
+#     and the network is offline here. The code below is written against FLAML's
+#     documented ts_forecast API and MUST be validated on a machine with FLAML
+#     before it is trusted. Everything ABOVE this line (harness + baselines) IS
+#     tested and verified. This wrapper is deliberately isolated behind the same
+#     forecaster signature so the tested harness is what actually scores it.
+# =========================================================================== #
+
+def make_flaml_forecaster(frequency: str, time_budget: int = 30):
+    """Return a forecaster closure fn(history_values, horizon) backed by FLAML ts_forecast.
+
+    FLAML's time-series API expects a dataframe with a time column and a target column, so the
+    closure rebuilds a minimal synthetic time index from the history length. The frequency is
+    used to advance the index for the forecast horizon.
+
+    UNTESTED here — see the banner above.
+    """
+    def _fn(history: list[float], horizon: int) -> list[float]:
+        from flaml import AutoML                       # lazy: keeps the module importable
+
+        freq = frequency or "D"
+        idx = pd.date_range("2000-01-01", periods=len(history), freq=freq)
+        train_df = pd.DataFrame({"ds": idx, "y": [float(v) for v in history]})
+
+        automl = AutoML()
+        automl.fit(
+            dataframe=train_df, label="y",
+            task="ts_forecast", time_budget=time_budget,
+            period=horizon, eval_method="holdout", verbose=0,
+        )
+        future_idx = pd.date_range(idx[-1], periods=horizon + 1, freq=freq)[1:]
+        pred = automl.predict(pd.DataFrame({"ds": future_idx}))
+        return [float(v) for v in np.asarray(pred).ravel()[:horizon]]
+
+    return _fn
+
+
+def run_forecast_evaluation(temporal_prep, horizon: int,
+                            frequency: str,
+                            seasonal_period: int | None = None,
+                            use_flaml: bool = True,
+                            n_folds: int = 5,
+                            time_budget: int = 30) -> dict:
+    """Glue for Step 3: backtest the mandatory naive baseline, optionally backtest the FLAML
+    model on the SAME harness, and compare. Decision #4: the naive baseline is always run.
+    This returns a plain dict; wiring it into ForecastResult + the quality gate is Step 4.
+
+    NOTE: the FLAML branch depends on make_flaml_forecaster, which is UNTESTED in this
+    environment. If FLAML is absent or errors, the baseline result is still returned and the
+    failure is reported — never a fabricated model score.
+    """
+    values = [h["y"] for h in temporal_prep.series if h["y"] is not None]
+    out = {"horizon": horizon, "frequency": frequency, "baseline": {}, "model": {},
+           "comparison": {}, "notes": []}
+
+    # --- mandatory naive baseline (always) ---
+    out["baseline"]["naive"] = backtest(values, naive_forecaster, horizon, n_folds)
+    if seasonal_period:
+        out["baseline"]["seasonal_naive"] = backtest(
+            values, seasonal_naive_forecaster(seasonal_period), horizon, n_folds)
+
+    # --- FLAML model (optional, isolated, may fail) ---
+    if use_flaml:
+        try:
+            fc = make_flaml_forecaster(frequency, time_budget)
+            out["model"]["flaml"] = backtest(values, fc, horizon, n_folds)
+        except Exception as e:
+            out["notes"].append(f"FLAML forecast unavailable: {e}")
+            out["model"]["flaml"] = {"error": str(e), "folds": [], "overall": {}}
+
+    # --- comparison (only if both scored) ---
+    base_mae = out["baseline"]["naive"].get("overall", {}).get("mae")
+    model_mae = out["model"].get("flaml", {}).get("overall", {}).get("mae")
+    if base_mae is not None and model_mae is not None:
+        out["comparison"] = {
+            "naive_mae": base_mae, "model_mae": model_mae,
+            "model_beats_naive": model_mae < base_mae,
+            "improvement_pct": round((base_mae - model_mae) / base_mae * 100, 2) if base_mae else None,
+        }
+    return out
