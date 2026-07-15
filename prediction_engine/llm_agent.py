@@ -6,7 +6,7 @@ analytical "LLM Forecast" mode (never for the numeric Predict path — numbers
 always come from the deterministic FLAML/sklearn model, per the charter's
 "Code Interpreter instead of LLM-generated numbers" principle).
 
-Requires an ANTHROPIC_API_KEY environment variable when run locally.
+Requires an OPENAI_API_KEY environment variable when run locally.
 If it is missing, the module fails gracefully and the rest of the engine
 (Profiling/Preprocessing/Training/Evaluation/Predict) keeps working normally.
 """
@@ -34,7 +34,7 @@ class LLMForecastAgent:
     """ReAct-orchestrated analytical agent (dspy.Predict is sufficient here since
     this is a single reasoning hop, not a multi-tool task)."""
 
-    def __init__(self, model: str = "anthropic/claude-sonnet-4-6"):
+    def __init__(self, model: str = "openai/gpt-4o-mini"):
         self.available = False
         self.error = None
 
@@ -42,9 +42,9 @@ class LLMForecastAgent:
             self.error = "The dspy library is not installed."
             return
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
-            self.error = "ANTHROPIC_API_KEY environment variable not found — add it to enable LLM Forecast mode."
+            self.error = "OPENAI_API_KEY environment variable not found — add it to enable LLM Forecast mode."
             return
 
         try:

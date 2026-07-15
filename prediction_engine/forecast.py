@@ -261,3 +261,163 @@ def prepare_series(df: pd.DataFrame, target_col: str,
         horizon=h, history=history, time_candidates=cand_dicts,
         run_log=run_log, warnings=warnings,
     )
+
+
+# =========================================================================== #
+# STEP 2 — Temporal preparation
+# Regularize the time grid, detect missing periods, apply an EXPLICIT gap
+# strategy. Still NO model, NO backtest, NO forecast, NO LLM.
+# =========================================================================== #
+
+# Gap-handling strategies, chosen explicitly by the caller (never silently):
+#   "none"        : leave gaps as missing (Step 1 behaviour)
+#   "ffill"       : carry the last observation forward (common, safe default for levels)
+#   "linear"      : linear interpolation between neighbours (smooth series)
+#   "zero"        : fill with 0 (only valid when absence truly means zero, e.g. counts)
+#   "mean"        : fill with the series mean (weak; offered for completeness)
+_GAP_STRATEGIES = ("none", "ffill", "linear", "zero", "mean")
+
+
+@dataclass
+class TemporalPrep:
+    """Result of Step 2. Carries the regularized, gap-handled series plus a full audit
+    of what was done — so the later backtest and the report can be honest about it."""
+    success: bool
+    time_col: str | None = None
+    target: str | None = None
+    frequency: str | None = None
+    strategy: str = "none"
+
+    series: list = field(default_factory=list)          # {ds, y} — regular grid, gaps handled
+    n_periods: int = 0                                   # length of the regular grid
+    n_observed: int = 0                                  # real observations
+    n_filled: int = 0                                    # values created by the strategy
+    gap_index: list = field(default_factory=list)        # positions that were originally missing
+    gap_runs: list = field(default_factory=list)         # [{start, end, length}] consecutive gaps
+    leading_trailing_trimmed: int = 0                    # edge gaps dropped, never invented
+
+    run_log: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+    error: str | None = None
+
+    def summary(self) -> dict:
+        return {
+            "success": self.success, "time_col": self.time_col, "target": self.target,
+            "frequency": self.frequency, "strategy": self.strategy,
+            "n_periods": self.n_periods, "n_observed": self.n_observed,
+            "n_filled": self.n_filled, "n_gap_runs": len(self.gap_runs),
+            "leading_trailing_trimmed": self.leading_trailing_trimmed,
+            "warnings": self.warnings, "error": self.error,
+        }
+
+
+def _find_gap_runs(mask_missing: list[bool]) -> list[dict]:
+    """Group consecutive missing positions into runs."""
+    runs, start = [], None
+    for i, m in enumerate(mask_missing):
+        if m and start is None:
+            start = i
+        elif not m and start is not None:
+            runs.append({"start": start, "end": i - 1, "length": i - start})
+            start = None
+    if start is not None:
+        runs.append({"start": start, "end": len(mask_missing) - 1,
+                     "length": len(mask_missing) - start})
+    return runs
+
+
+def prepare_temporal(forecast_result: ForecastResult,
+                     strategy: str) -> TemporalPrep:
+    """STEP 2: take the ForecastResult history from Step 1 and produce a clean, regular,
+    gap-handled series ready for a model.
+
+    `strategy` is REQUIRED and explicit — there is deliberately no default. Choosing how to
+    fill gaps is a semantic decision (a level series wants ffill/linear, a count series wants
+    zero) that depends on what the target MEANS, which this step cannot know. Deferring that
+    logic to a later stage means the caller must state the strategy every time. Pass "none" to
+    regularize and audit the gaps without filling them.
+
+    Interior gaps are FILLED per the chosen strategy; leading/trailing gaps are TRIMMED, never
+    invented (you cannot back-cast history you never observed)."""
+    if not forecast_result.success:
+        return TemporalPrep(success=False, error="Step 1 did not succeed; nothing to prepare.")
+    if strategy not in _GAP_STRATEGIES:
+        return TemporalPrep(success=False, error=f"Unknown gap strategy '{strategy}'. "
+                            f"Choose one of {_GAP_STRATEGIES}.")
+
+    history = forecast_result.history
+    run_log: list[str] = []
+    warnings: list[str] = []
+
+    y_raw = [h["y"] for h in history]
+    ds = [h["ds"] for h in history]
+    missing = [v is None or (isinstance(v, float) and pd.isna(v)) for v in y_raw]
+
+    # --- trim leading / trailing gaps (never fabricate edge history) ---
+    first = next((i for i, m in enumerate(missing) if not m), None)
+    last = next((i for i in range(len(missing) - 1, -1, -1) if not missing[i]), None)
+    if first is None:
+        return TemporalPrep(success=False, time_col=forecast_result.time_col,
+                            target=forecast_result.target, frequency=forecast_result.frequency,
+                            error="No observed values in the series.")
+    trimmed = (first) + (len(missing) - 1 - last)
+    ds = ds[first:last + 1]
+    y_raw = y_raw[first:last + 1]
+    missing = missing[first:last + 1]
+    if trimmed:
+        run_log.append(f"[Temporal] Trimmed {trimmed} leading/trailing empty period(s) "
+                       "(edge history is never fabricated).")
+
+    gap_index = [i for i, m in enumerate(missing) if m]
+    gap_runs = _find_gap_runs(missing)
+    n_observed = len(missing) - len(gap_index)
+
+    if gap_runs:
+        longest = max(r["length"] for r in gap_runs)
+        run_log.append(f"[Temporal] {len(gap_index)} missing interior period(s) in "
+                       f"{len(gap_runs)} run(s); longest run = {longest}.")
+        if longest >= max(3, int(0.1 * len(missing))):
+            warnings.append(f"A gap run of {longest} periods is long relative to the series; "
+                            f"values filled there by '{strategy}' are low-confidence.")
+    else:
+        run_log.append("[Temporal] No interior gaps on the regular grid.")
+
+    # --- apply the explicit strategy to interior gaps ---
+    s = pd.Series([np.nan if m else float(v) for v, m in zip(y_raw, missing)])
+    if not gap_index or strategy == "none":
+        filled = s
+        applied = "none"
+    elif strategy == "ffill":
+        filled = s.ffill()
+        applied = "ffill"
+    elif strategy == "linear":
+        filled = s.interpolate(method="linear", limit_direction="both")
+        applied = "linear"
+    elif strategy == "zero":
+        filled = s.fillna(0.0)
+        applied = "zero"
+    else:  # mean
+        filled = s.fillna(float(s.mean()))
+        applied = "mean"
+
+    n_filled = int(s.isna().sum() - filled.isna().sum())
+    if n_filled:
+        run_log.append(f"[Temporal] Filled {n_filled} interior gap(s) using '{applied}'.")
+
+    still_missing = int(filled.isna().sum())
+    if still_missing:
+        warnings.append(f"{still_missing} value(s) still missing after '{applied}'. "
+                        "A gap strategy must be chosen before modelling, or the model step "
+                        "will have to handle missing values itself.")
+
+    series = [{"ds": d, "y": (None if pd.isna(v) else float(v))}
+              for d, v in zip(ds, filled)]
+
+    return TemporalPrep(
+        success=True,
+        time_col=forecast_result.time_col, target=forecast_result.target,
+        frequency=forecast_result.frequency, strategy=applied,
+        series=series, n_periods=len(series), n_observed=n_observed,
+        n_filled=n_filled, gap_index=gap_index, gap_runs=gap_runs,
+        leading_trailing_trimmed=trimmed, run_log=run_log, warnings=warnings,
+    )

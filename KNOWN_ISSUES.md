@@ -754,3 +754,52 @@ ordered-int ok · non-numeric-target refused · too-short refused · multi-candi
 
 ## NOT built yet (awaiting Step 1 review)
 FLAML forecasting, baseline, backtest, intervals, visuals, report, LLM narrative.
+
+---
+
+# Anthropic dependency removed + Forecast STEP 2
+
+## Anthropic -> OpenAI (provider cleanup)
+Full grep before/after. Every reference switched:
+
+| file | was | now |
+|---|---|---|
+| llm_agent.py | model "anthropic/claude-sonnet-4-6", ANTHROPIC_API_KEY | "openai/gpt-4o-mini", OPENAI_API_KEY |
+| app.py | ANTHROPIC_API_KEY (3 spots) | OPENAI_API_KEY |
+| requirements.txt | anthropic>=0.116.0 | openai>=1.40.0 |
+| README.md | "DSPy + Claude", sk-ant- | "DSPy + OpenAI", sk- |
+
+Verified: zero `anthropic` / `ANTHROPIC_API_KEY` references remain. The agent still degrades
+gracefully with no key (`available=False`, error names OPENAI). ML core untouched.
+
+## Forecast STEP 2 — Temporal preparation (no model, no LLM)
+Added `prepare_temporal()` + `TemporalPrep` to `forecast.py`.
+
+- **Regularize:** consumes the Step-1 regular grid.
+- **Detect missing periods:** interior gaps grouped into runs (`gap_runs`), long runs warned.
+- **Explicit gap strategy:** one of `none | ffill | linear | zero | mean`, chosen by the caller,
+  never silent. Unknown strategy is rejected.
+- **Edge policy:** leading/trailing gaps are TRIMMED, never filled — edge history is not
+  fabricated. Interior gaps are filled per strategy.
+- Full audit on the result: n_observed, n_filled, gap_runs, leading_trailing_trimmed.
+
+Verified: 4 edge periods trimmed, 7 interior gaps filled under each strategy, long-gap warning
+fires, bad strategy rejected, no interior None left after fill.
+
+NOT built: FLAML forecasting, backtest, intervals, visuals, report, LLM narrative.
+
+---
+
+# Step 2 adjustment — gap strategy is now REQUIRED (no default)
+
+Per review: `ffill` must not be the silent default. Changed `prepare_temporal(fr, strategy)` so
+`strategy` is a required positional argument — there is no default at all. Calling without it
+raises `TypeError`, which forces every call site to state the strategy explicitly until the
+gap-handling logic is defined in a later stage.
+
+- `strategy="none"` regularizes and audits gaps WITHOUT filling, and warns that a strategy must
+  be chosen before modelling.
+- `ffill | linear | zero | mean` unchanged.
+- unknown strategy still rejected.
+
+No default fill is applied anywhere. The decision stays with the caller.
